@@ -239,6 +239,9 @@
                                                    src_hash='') }}".slice(0, -2);
     Vue.prototype.$stmt_types = {{ stmt_types_json }};
     Vue.prototype.$sources = {{ sources_dict }};
+    {% if evidence_sort %}
+    Vue.prototype.$evidence_sort = "{{ evidence_sort }}";
+    {% endif %}
     var app = new Vue({el: '#app'});
   </script>
 {% endblock %}

@@ -82,25 +82,40 @@ def submit_curation(hash_val, tag, curator, ip, text=None, ev_hash=None,
 
 
 def get_curations(db=None, **params):
-    """Get all curations for a certain level given certain criteria."""
-    if db is None:
+    """Get all curations for a certain level given certain criteria.
+
+    A handle passed as ``db`` is left open for the caller. A handle created
+    here is released before returning (also on errors), so repeated calls
+    (e.g. ``with_cur_counts`` on every web request) do not retain sessions
+    and connection pools.
+    """
+    owned = db is None
+    if owned:
         db = get_db('primary')
-    cur = db.Curation
+    try:
+        cur = db.Curation
 
-    constraints = []
-    for key, val in params.items():
-        if key == 'hash_val':
-            key = 'pa_hash'
-        elif key == 'ev_hash':
-            key = 'source_hash'
+        constraints = []
+        for key, val in params.items():
+            if key == 'hash_val':
+                key = 'pa_hash'
+            elif key == 'ev_hash':
+                key = 'source_hash'
 
-        if isinstance(val, list) or isinstance(val, set) \
-           or isinstance(val, tuple):
-            constraints.append(getattr(cur, key).in_(val))
-        else:
-            constraints.append(getattr(cur, key) == val)
+            if isinstance(val, list) or isinstance(val, set) \
+               or isinstance(val, tuple):
+                constraints.append(getattr(cur, key).in_(val))
+            else:
+                constraints.append(getattr(cur, key) == val)
 
-    return [c.to_json() for c in db.select_all(cur, *constraints)]
+        return [c.to_json() for c in db.select_all(cur, *constraints)]
+    finally:
+        if owned and db is not None:
+            try:
+                db.close()
+            except Exception as error:
+                logger.warning('Could not release curation database '
+                               'handle: %s', error)
 
 
 def get_grounding_curations(db=None):

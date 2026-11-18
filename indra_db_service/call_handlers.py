@@ -1,7 +1,9 @@
 __all__ = ['ApiCall', 'FromAgentsApiCall', 'FromHashApiCall',
            'FromHashesApiCall', 'FromPapersApiCall', 'FromSimpleJsonApiCall',
-           'FromAgentJsonApiCall', 'DirectQueryApiCall', 'pop_request_bool']
+           'FromAgentJsonApiCall', 'DirectQueryApiCall', 'pop_request_bool',
+           'ProvenanceApiCall']
 
+import os
 import sys
 import json
 import logging
@@ -28,6 +30,13 @@ from indra_db_service.config import MAX_STMTS, REDACT_MESSAGE, TITLE, TESTING, \
 from indra_db_service.errors import HttpUserError, ResultTypeError
 from indra_db_service.llm import add_llm_relation_correctness, \
     add_llm_verifications
+from indra_db_service.provenance import (add_provenance_annotations,
+    get_provenance_classifications, ProvenanceUnavailable)
+from indra_db.client.readonly.evidence_ranking import (
+    EvidenceRankingRequest, EvidenceRankingUnavailable, EvidenceCursorStale,
+    MAX_PAGE_SIZE, POLICY_VERSION)
+from indra_db_service.evidence_cursor import (CursorError, CursorMismatch,
+    check_cursor, context_digest, decode_cursor, encode_cursor)
 from indra_db_service.util import LogTracker, sec_since, get_source,\
     process_agent,  process_mesh_term, DbAPIError, iter_free_agents, \
     _make_english_from_meta
@@ -40,6 +49,15 @@ rev_source_mapping = {v: k for k, v in internal_source_mappings.items()}
 
 def pop_request_bool(args, key, default):
     return args.pop(key, str(default).lower()).lower() == 'true'
+
+
+EVIDENCE_RANKING_FLAG = 'INDRA_DB_API_EVIDENCE_RANKING'
+RANKING_SNAPSHOT_ENV = 'INDRA_DB_API_RANKING_SNAPSHOT'
+EVIDENCE_SORT_MODES = {'classification'}
+
+
+def evidence_ranking_enabled():
+    return os.environ.get(EVIDENCE_RANKING_FLAG, '').lower() in {'1', 'true'}
 
 
 class ApiCall:
@@ -104,11 +122,14 @@ class ApiCall:
         self.db_query = None
         self.ev_filter = None
         self.special = {}
+        self.evidence_sort = None
         return
 
     valid_result_types = ['statements', 'interactions', 'agents', 'hashes']
 
     def run(self, result_type):
+        if self.evidence_sort is not None and result_type != 'statements':
+            raise HttpUserError('evidence_sort applies only to statements')
 
         # Get the db query object.
         logger.info("Running function %s after %s seconds."
@@ -118,7 +139,21 @@ class ApiCall:
         params = dict(offset=self.offs, limit=self.limit,
                       sort_by=self.sort_by)
         logger.info(f"Sending query with params: {params}")
-        if result_type == 'statements':
+        if result_type == 'statements' and self.evidence_sort is not None:
+            ranking = self._evidence_ranking_request()
+            try:
+                res = self.get_db_query().get_statements(
+                    evidence_filter=self.ev_filter,
+                    evidence_ranking=ranking,
+                    **params
+                )
+            except EvidenceRankingUnavailable as error:
+                raise HttpUserError(f'Evidence ranking unavailable: {error}',
+                                    503)
+            except EvidenceCursorStale as error:
+                raise HttpUserError(f'{error}; restart pagination', 409)
+            self.special['evidence_ranking'] = ranking
+        elif result_type == 'statements':
             self.special['ev_limit'] = \
                 self._pop('ev_limit', self.default_ev_lim, int)
             res = self.get_db_query().get_statements(
@@ -265,6 +300,11 @@ class ApiCall:
                         if stmt is None:
                             stmt = stmts_from_json([entry])[0]
                         eng = _format_stmt_text(stmt)
+                        # Formatting must retain the stored record identity,
+                        # including when the text was previously redacted.
+                        for evidence, original in zip(stmt.evidence, entry['evidence']):
+                            if original.get('source_hash') is not None:
+                                evidence.source_hash = original['source_hash']
                         entry['evidence'] = _format_evidence_text(stmt)
                     else:
                         eng = _make_english_from_meta(entry)
@@ -319,6 +359,12 @@ class ApiCall:
 
 
 class StatementApiCall(ApiCall):
+    # Evidence ranking needs the evidence filter to be reproducible from
+    # request parameters (paper_ids, mesh_ids, filter_ev, permissions), so
+    # that a continuation request applies exactly the same filter.
+    supports_evidence_ranking = True
+    supports_evidence_cursor = False
+
     def __init__(self, env):
         super(StatementApiCall, self).__init__(env)
         self.web_query['mesh_ids'] = \
@@ -330,10 +376,114 @@ class StatementApiCall(ApiCall):
                     f"filtered.")
         self.agent_dict = {}
         self.agent_set = set()
+        self.evidence_sort = self._pop('evidence_sort', None)
+        self.evidence_cursor_token = self._pop('evidence_cursor', None)
+        self.evidence_filter_context = {'filter_ev': self.filter_ev,
+                                        'paper_ids': [], 'mesh_ids': []}
+        if self.evidence_sort is None:
+            if self.evidence_cursor_token is not None:
+                raise HttpUserError('evidence_cursor requires '
+                                    'evidence_sort=classification')
+        elif self.evidence_sort not in EVIDENCE_SORT_MODES:
+            raise HttpUserError(f'Unsupported evidence_sort: '
+                                f'{self.evidence_sort}')
+        elif not self.supports_evidence_ranking:
+            raise HttpUserError('evidence_sort is not supported for this '
+                                'query method')
+        elif (self.evidence_cursor_token is not None
+              and not self.supports_evidence_cursor):
+            raise HttpUserError('evidence_cursor is only accepted by '
+                                'statements/from_hash/<hash>; first pages of '
+                                'multi-statement queries return one cursor '
+                                'per statement')
         return
 
     def _build_db_query(self):
         raise NotImplementedError()
+
+    def _cursor_statement_hash(self):
+        raise HttpUserError('evidence_cursor is not supported here')
+
+    def _evidence_ranking_request(self):
+        """Validate ranked-mode inputs; bind cursors to filters and access."""
+        if not evidence_ranking_enabled():
+            raise HttpUserError('Evidence ranking is not enabled on this '
+                                'server', 503)
+        raw_limit = self._pop('ev_limit', None)
+        try:
+            page_size = (min(self.default_ev_lim, MAX_PAGE_SIZE)
+                         if raw_limit is None else int(raw_limit))
+        except ValueError:
+            raise HttpUserError('ev_limit must be an integer')
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise HttpUserError(f'With evidence_sort, ev_limit must be '
+                                f'between 1 and {MAX_PAGE_SIZE}')
+        self.special['ev_limit'] = page_size
+        # Builds the query and evidence filter (including the permission
+        # restriction) exactly as for the legacy path.
+        self.get_db_query()
+        self.ranking_filter_digest = context_digest(
+            self.evidence_filter_context)
+        self.ranking_access_digest = context_digest(
+            {k: bool(v) for k, v in self.has.items()})
+        generation_id = after = None
+        if self.evidence_cursor_token is not None:
+            try:
+                cursor = decode_cursor(self.evidence_cursor_token)
+            except CursorError as error:
+                raise HttpUserError(str(error))
+            try:
+                check_cursor(cursor, self._cursor_statement_hash(),
+                             self.ranking_filter_digest,
+                             self.ranking_access_digest)
+            except CursorMismatch as error:
+                raise HttpUserError(str(error), 409)
+            generation_id = cursor['generation_id']
+            after = (cursor['mk_hash'], cursor['priority'],
+                     cursor['raw_record_id'])
+        return EvidenceRankingRequest(
+            page_size, generation_id=generation_id, after=after,
+            snapshot_label=os.environ.get(RANKING_SNAPSHOT_ENV) or None)
+
+    def _add_evidence_pagination(self, res_json, result, ranking):
+        generation = ranking.generation
+        pages = getattr(result, 'evidence_pages', {})
+        res_json['evidence_ranking'] = {
+            'mode': self.evidence_sort,
+            'policy_version': POLICY_VERSION,
+            'matching_policy_version': generation['matching_policy_version'],
+            'generation_id': str(generation['generation_id']),
+            'snapshot_label': generation['snapshot_label'],
+            'scope': generation['scope_kind'],
+            'provenance_run_id': generation['provenance_run_id'],
+            'correctness_run_id': generation['correctness_run_id'],
+            'page_size': ranking.page_size,
+        }
+        out = {}
+        for mk_hash, stmt in result.results.items():
+            page = pages.get(mk_hash) or pages.get(int(mk_hash)) or {}
+            records = page.get('records', [])
+            evidence = stmt.get('evidence', [])
+            # with_english reformatting rebuilds evidence dicts in the same
+            # order; re-attach the per-record ranking metadata.
+            if len(evidence) == len(records):
+                for ev_json, record in zip(evidence, records):
+                    ev_json.setdefault('evidence_ranking', record)
+            cursor = None
+            if page.get('has_more') and page.get('last'):
+                cursor = encode_cursor(
+                    generation['generation_id'], generation['snapshot_label'],
+                    mk_hash, page['last'][0], page['last'][1],
+                    self.ranking_filter_digest, self.ranking_access_digest)
+            out[str(mk_hash)] = {
+                'has_more': bool(page.get('has_more')),
+                'next_cursor': cursor,
+                'returned': len(evidence),
+                'ranked': bool(page.get('ranked', False)),
+                # Stable record identities for client-side append/dedupe.
+                'record_ids': [r['raw_record_id'] for r in records],
+            }
+        res_json['evidence_pages'] = out
 
     @staticmethod
     def get_curation_counts(result):
@@ -358,6 +508,22 @@ class StatementApiCall(ApiCall):
     def produce_response(self, result):
         if result.result_type == 'statements':
             add_llm_verifications(result.results)
+            add_provenance_annotations(result.results)
+            ranking = self.special.get('evidence_ranking')
+            if ranking is not None:
+                # A replacement sidecar must not silently change the labels
+                # displayed for an immutable ranked generation/cursor.
+                expected_run = ranking.generation['provenance_run_id']
+                for stmt_hash, statement in result.results.items():
+                    page = result.evidence_pages.get(stmt_hash, {})
+                    if not page.get('ranked'):
+                        continue
+                    for evidence in statement.get('evidence', []):
+                        annotation = evidence.get('provenance_classification')
+                        if annotation and annotation.get('run_id') != expected_run:
+                            raise HttpUserError(
+                                'Provenance display run does not match the ranking generation',
+                                503)
             res_json = result.json()
 
             # Add derived values to the res_json.
@@ -369,6 +535,9 @@ class StatementApiCall(ApiCall):
                 (len(result.results) < MAX_STMTS)
             res_json['statements_removed'] = 0
             res_json['evidence_returned'] = result.returned_evidence
+            ranking = self.special.get('evidence_ranking')
+            if ranking is not None and self.fmt != 'html':
+                self._add_evidence_pagination(res_json, result, ranking)
 
             # Build the HTML if HTML, else just tweak the JSON.
             stmts_json = result.results
@@ -548,6 +717,12 @@ class StatementApiCall(ApiCall):
             id_val = int(val) if typ in ['tcid', 'trid'] else val
             id_tpls.add((typ, id_val))
 
+        # Canonical evidence-filter context for continuation cursors.
+        self.evidence_filter_context = {
+            'filter_ev': self.filter_ev,
+            'paper_ids': sorted([typ, str(val)] for typ, val in id_tpls),
+            'mesh_ids': [],
+        }
         if id_tpls:
             paper_q = FromPapers(id_tpls)
             if db_query is not None:
@@ -558,6 +733,8 @@ class StatementApiCall(ApiCall):
         # Unpack mesh ids.
         mesh_ids = self._pop('mesh_ids', [])
         if mesh_ids:
+            self.evidence_filter_context['mesh_ids'] = sorted(
+                str(process_mesh_term(m)) for m in mesh_ids)
             mesh_q = FromMeshIds([process_mesh_term(m) for m in mesh_ids])
             if db_query is not None:
                 db_query &= mesh_q
@@ -626,6 +803,34 @@ class FromAgentsApiCall(StatementApiCall):
         return db_query
 
 
+class ProvenanceApiCall(StatementApiCall):
+    """Dedicated lookup retaining normal query authorization and filtering."""
+
+    def __init__(self, env, hashes, explanations, evidence_limit):
+        super().__init__(env)
+        self.provenance_hashes = hashes
+        self.provenance_explanations = explanations
+        self.web_query.poplist('statement')
+        self.web_query.poplist('explanation')
+        self.web_query['ev_limit'] = evidence_limit
+        self.limit = len(hashes)
+
+    def _build_db_query(self):
+        self.web_query['hashes'] = self.provenance_hashes
+        return self._db_query_from_web_query()
+
+    def produce_response(self, result):
+        try:
+            payload = get_provenance_classifications(
+                result.results, self.provenance_hashes, result.evidence_counts,
+                self.provenance_explanations,
+                evidence_limit=self.special['ev_limit'])
+        except ProvenanceUnavailable:
+            return Response('Provenance database is unavailable or incompatible.', 503)
+        return Response(json.dumps(payload), mimetype='application/json',
+                        headers={'Cache-Control': 'no-store'})
+
+
 class FromHashesApiCall(StatementApiCall):
     def _build_db_query(self):
         hashes = request.json.get('hashes')
@@ -639,10 +844,18 @@ class FromHashesApiCall(StatementApiCall):
 
 class FromHashApiCall(StatementApiCall):
     default_ev_lim = 1000
+    supports_evidence_cursor = True
 
     def _build_db_query(self):
-        self.web_query['hashes'] = [self._pop('hash')]
+        self.requested_hash = self._pop('hash')
+        self.web_query['hashes'] = [self.requested_hash]
         return self._db_query_from_web_query()
+
+    def _cursor_statement_hash(self):
+        try:
+            return int(str(self.requested_hash))
+        except ValueError:
+            raise HttpUserError('Invalid statement hash')
 
 
 class FromPapersApiCall(StatementApiCall):
@@ -678,6 +891,10 @@ class FromAgentJsonApiCall(StatementApiCall):
 
 
 class FromSimpleJsonApiCall(StatementApiCall):
+    # Its evidence filter comes from the arbitrary query JSON and cannot be
+    # reproduced by a from_hash continuation request.
+    supports_evidence_ranking = False
+
     def __init__(self, env):
         super(FromSimpleJsonApiCall, self).__init__(env)
         self.web_query['complexes_covered'] = \

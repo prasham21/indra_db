@@ -26,6 +26,8 @@ from indra_db.exceptions import BadHashError
 from indra_db.client.principal.curation import *
 from indra_db.client.readonly import AgentJsonExpander, Query
 from indra_db.util.constructors import get_ro_host
+from indra_db.config import get_readonly_databases
+from sqlalchemy.engine.url import make_url
 
 from indralab_auth_tools.auth import auth, resolve_auth, config_auth
 from indralab_auth_tools.log import note_in_log, set_log_service_name, user_log_endpoint
@@ -41,6 +43,8 @@ from indra_db_service.llm import (
     add_llm_relation_correctness,
     get_llm_verifications,
 )
+from indra_db_service.provenance import parse_provenance_request
+from indra_db_service.call_handlers import evidence_ranking_enabled
 from indra_db_service.util import (
     sec_since,
     get_s3_client,
@@ -242,6 +246,7 @@ def search():
         stmt_types_json=stmt_types_json,
         reverse_source_mapping=rev_source_mapping,
         sources_dict=sources_dict,
+        evidence_sort="classification" if evidence_ranking_enabled() else None,
     )
 
 
@@ -361,6 +366,35 @@ def old_search():
     )
 
 
+def _configured_ro_host(ro_label="primary"):
+    """Readonly DB host for the usage log, read from configuration.
+
+    get_ro_host() constructs and connects a whole ReadonlyDatabaseManager
+    (rebuilding every readonly ORM class) just to read the host; measured at
+    ~9 ms of every statement request locally. Same value whenever the
+    database is reachable; logged even when it is not.
+    """
+    try:
+        databases = get_readonly_databases()
+        if ro_label == "primary" and "override" in databases:
+            ro_label = "override"
+        url = databases.get(ro_label)
+        return make_url(url).host if url else None
+    except Exception as error:  # Logging must never break a request.
+        logger.warning(f"Could not read readonly host: {error}")
+        return None
+
+
+@app.route("/provenance/classifications", methods=["GET"])
+@user_log_endpoint
+def provenance_classifications():
+    try:
+        hashes, explanations, evidence_limit = parse_provenance_request(request.args)
+    except ValueError as error:
+        return jsonify(error=str(error)), 400
+    return ProvenanceApiCall(env, hashes, explanations, evidence_limit).run('statements')
+
+
 @app.route("/llm/verifications", methods=["GET"])
 @user_log_endpoint
 def llm_verifications():
@@ -415,7 +449,7 @@ def get_statements(result_type, method):
         return Response("Page not found.", 404)
 
     note_in_log(method=method, result_type=result_type)
-    note_in_log(db_host=get_ro_host("primary"))
+    note_in_log(db_host=_configured_ro_host("primary"))
 
     if method == "from_agents" and request.method == "GET":
         call = FromAgentsApiCall(env)

@@ -8,13 +8,13 @@ __all__ = ['Query', 'Intersection', 'Union', 'MergeQuery', 'HasAgent',
 import re
 import json
 import logging
-from functools import lru_cache
+from functools import lru_cache, wraps
 from itertools import combinations
 from typing import Optional, Iterable
 from typing import Union as TypeUnion
 from collections import OrderedDict, defaultdict
 from sqlalchemy import desc, true, select, or_, except_, func, null, and_, \
-    String, union, intersect
+    String, union, intersect, tuple_, literal, exists, SmallInteger, cast
 
 from indra import get_config
 from indra.sources.indra_db_rest.query_results import QueryResult, \
@@ -26,8 +26,48 @@ from indra_db.readonly_dumping.util import clean_json_loads
 from indra_db.schemas.readonly_schema import ro_role_map, ro_type_map, \
     SOURCE_GROUPS
 from indra_db.util import regularize_agent_id, get_ro
+from indra_db.client.readonly.evidence_ranking import (
+    tables as ranking_tables, resolve_generation, UNRANKED_PRIORITY,
+    EvidenceRankingRequest, CORRECTNESS_STATUS_NAMES,
+    PROVENANCE_STATUS_NAMES)
 
 logger = logging.getLogger(__name__)
+
+
+def _release_owned_readonly(method):
+    """Release a readonly handle that the method itself created.
+
+    These query methods construct a fresh readonly handle via get_ro() when
+    none is passed (one per REST request). Previously nothing closed it: the
+    session kept its connection "idle in transaction" and the engine's pool
+    kept its connections open until cyclic garbage collection, so a busy
+    service accumulated connections. A handle passed in by the caller is
+    never touched; results are fully materialized before release. Each
+    request still gets its own handle and session (nothing is shared).
+
+    This relies on get_ro() returning a NEW, caller-owned handle. A future
+    per-process reuse must share only the engine/pool and keep a separate
+    session per call; making get_ro() return a shared session-bearing
+    manager would let this wrapper close other requests' sessions.
+
+    If get_ro() returns None (database unreachable), the method receives
+    None after a single attempt, exactly as before this wrapper existed.
+    """
+    @wraps(method)
+    def wrapper(self, ro=None, *args, **kwargs):
+        if ro is not None:
+            return method(self, ro, *args, **kwargs)
+        ro = get_ro('primary')
+        try:
+            return method(self, ro, *args, **kwargs)
+        finally:
+            if ro is not None:
+                try:
+                    ro.close()
+                except Exception as error:  # Never mask the real outcome.
+                    logger.warning(f"Could not release readonly handle: "
+                                   f"{error}")
+    return wrapper
 
 
 def _make_agent_dict(ag_dict):
@@ -418,8 +458,10 @@ class Query(object):
         """
         self._print_only = print_only
 
+    @_release_owned_readonly
     def get_statements(self, ro=None, limit=None, offset=None,
-                       sort_by='ev_count', ev_limit=None, evidence_filter=None) \
+                       sort_by='ev_count', ev_limit=None, evidence_filter=None,
+                       evidence_ranking=None) \
             -> Optional[StatementQueryResult]:
         """Get the statements that satisfy this query.
 
@@ -442,6 +484,13 @@ class Query(object):
         evidence_filter : None or EvidenceFilter
             If None, no filtering will be applied. Otherwise, an EvidenceFilter
             class must be provided.
+        evidence_ranking : None or EvidenceRankingRequest
+            If given, evidence within each statement is ordered by the
+            precomputed priority of the active (or cursor-pinned) ranking
+            generation BEFORE the per-statement page limit is applied, and
+            ``ev_limit`` is ignored in favour of the request's page size. The
+            result gains an ``evidence_pages`` attribute with per-statement
+            pagination state. Statement selection and order are unchanged.
 
         Returns
         -------
@@ -449,12 +498,19 @@ class Query(object):
             An object holding the JSON result from the database, as well as the
             metadata for the query.
         """
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
 
         # If the result is by definition empty, save ourselves time and work.
         if self.empty:
-            return StatementQueryResult.empty(limit, offset, self.to_json())
+            result = StatementQueryResult.empty(limit, offset, self.to_json())
+            if evidence_ranking is not None:
+                result.evidence_pages = {}
+            return result
+
+        if evidence_ranking is not None:
+            return self._get_ranked_statements(ro, limit, offset, sort_by,
+                                               evidence_filter,
+                                               evidence_ranking)
 
         # Get the query for mk_hashes and ev_counts, and apply the generic
         # limits to it.
@@ -591,34 +647,7 @@ class Query(object):
 
             # Add annotations if not present.
             if ev_limit != 0:
-                raw_json = clean_json_loads(raw_json_bts.decode('utf-8'))
-                ev_json = raw_json['evidence'][0]
-                if 'annotations' not in ev_json.keys():
-                    ev_json['annotations'] = {}
-
-                # Add agents' raw text to annotations.
-                ev_json['annotations']['agents'] = \
-                    {'raw_text': _get_raw_texts(raw_json)}
-
-                # Add prior UUIDs to the annotations
-                if 'prior_uuids' not in ev_json['annotations'].keys():
-                    ev_json['annotations']['prior_uuids'] = []
-                ev_json['annotations']['prior_uuids'].append(raw_json['id'])
-
-                # Add and/or update text refs.
-                if 'text_refs' not in ev_json.keys():
-                    ev_json['text_refs'] = {}
-                if ref_dict['pmid']:
-                    ev_json['pmid'] = ref_dict['pmid']
-                elif 'PMID' in ev_json['text_refs']:
-                    del ev_json['text_refs']['PMID']
-                ev_json['text_refs'].update({k.upper(): v
-                                             for k, v in ref_dict.items()
-                                             if v is not None})
-
-                # Add the source dictionary.
-                if ref_dict['source']:
-                    ev_json['annotations']['content_source'] = ref_dict['source']
+                ev_json = _evidence_json_from_row(raw_json_bts, ref_dict)
 
                 # Add the evidence JSON to the list.
                 stmts_dict[mk_hash]['evidence'].append(ev_json)
@@ -627,6 +656,235 @@ class Query(object):
                                     beliefs, returned_evidence, source_counts,
                                     self.to_json())
 
+    def _get_ranked_statements(self, ro, limit, offset, sort_by,
+                               evidence_filter, ranking):
+        """Statements with evidence ordered by precomputed priority.
+
+        Statement selection is the unchanged hash query (same sort/limits).
+        For each selected statement a LATERAL subquery walks the narrow
+        priority index ``(generation_id, mk_hash, priority, raw_record_id)``,
+        applies the SAME evidence filter joins/predicates as the legacy path
+        (authorization included), and stops after ``page_size + 1`` eligible
+        records. JSON is fetched only for those records. The final ORDER BY
+        makes both statement order and evidence order explicit.
+        """
+        if not isinstance(ranking, EvidenceRankingRequest):
+            raise TypeError('evidence_ranking must be an EvidenceRankingRequest')
+
+        # Build the (unchanged) statement hash query first. Touching
+        # ro.SourceMeta reflects its source columns on a pooled connection;
+        # doing that before checking out the session connection lets the
+        # pool reuse it, as on the legacy path.
+        ro.SourceMeta
+        mk_hashes_q = self.build_hash_query(ro).distinct()
+        if sort_by == 'ev_count':
+            sort_term = [desc(self._get_core_cols(ro)[1])]
+        elif sort_by == 'belief':
+            sort_term = [desc(self._get_core_cols(ro)[2])]
+        else:
+            raise ValueError(f"Invalid sort option: {sort_by}.")
+
+        # One connection for the generation lookup and the query: the
+        # readonly session is in autocommit mode, so every
+        # session.connection() call checks out another pooled connection.
+        # (Measured: otherwise ranked requests held one connection more
+        # than legacy ones until garbage collection.)
+        connection = ro.session.connection()
+        try:
+            generation = resolve_generation(connection, ranking)
+        except Exception:
+            ro.session.rollback()
+            raise
+        ranking.generation = generation
+        gen_id = generation['generation_id']
+
+        mk_hashes_q = self._apply_limits(mk_hashes_q, sort_term, limit, offset)
+        mk_hashes_al = mk_hashes_q.subquery('mk_hashes')
+        if sort_by == 'ev_count':
+            outer_sort = desc(mk_hashes_al.c.ev_count)
+        else:
+            outer_sort = desc(mk_hashes_al.c.belief)
+
+        frp = ro.FastRawPaLink
+        prio_t = ranking_tables.evidence_priority
+        fetch_n = ranking.page_size + 1
+        multiplying = {'raw_stmt_mesh_terms', 'raw_stmt_mesh_concepts'}
+
+        def finish(q, prio_col, id_col):
+            if evidence_filter is not None:
+                joined = {'fast_raw_pa_link'}
+                q = evidence_filter.join_table(ro, q, joined)
+                q = evidence_filter.apply_filter(ro, q)
+                # MeSH joins can emit one row per matching term: never let a
+                # record consume two page slots.
+                if joined & multiplying:
+                    q = q.distinct()
+            if ranking.after is not None:
+                _, after_prio, after_id = ranking.after
+                q = q.filter(tuple_(prio_col, id_col)
+                             > tuple_(literal(after_prio), literal(after_id)))
+            return q.order_by(prio_col, id_col).limit(fetch_n)
+
+        # Ranked records: walk the narrow priority index in (priority, id)
+        # order and stop after page_size + 1 eligible rows. The generation
+        # covers exactly the records of its pinned snapshot (audited), so no
+        # join is needed to establish membership. Evidence filters (including
+        # the permission filter) are applied as a correlated EXISTS against
+        # the evidence table with the SAME filter joins/predicates as the
+        # legacy path. EXISTS never multiplies rows (MeSH joins included).
+        # Measured: without this shape PostgreSQL hash-joins and sorts every
+        # record of a large statement (it estimates ~4 rows per statement).
+        ranked_q = (ro.session
+                    .query(prio_t.c.priority.label('ev_priority'),
+                           prio_t.c.raw_record_id.label('raw_record_id'),
+                           prio_t.c.correctness_status.label('c_status'),
+                           prio_t.c.provenance_status.label('p_status'))
+                    .filter(prio_t.c.generation_id == gen_id,
+                            prio_t.c.mk_hash == mk_hashes_al.c.mk_hash))
+        if evidence_filter is not None:
+            ev_q = (ro.session.query(literal(1)).select_from(frp)
+                    .filter(frp.id == prio_t.c.raw_record_id,
+                            frp.mk_hash == prio_t.c.mk_hash))
+            joined = {'fast_raw_pa_link'}
+            ev_q = evidence_filter.join_table(ro, ev_q, joined)
+            ev_q = evidence_filter.apply_filter(ro, ev_q)
+            # OFFSET 0 keeps the EXISTS a per-row check on the ordered index
+            # scan (PostgreSQL does not flatten EXISTS subqueries with OFFSET),
+            # i.e. probe records in priority order until the page is full --
+            # the same cost profile as the legacy lateral, which probes in
+            # physical order. Measured: letting the planner semi-join instead
+            # read every record of large statements for selective MeSH filters.
+            ev_q = ev_q.offset(0)
+            ranked_q = ranked_q.filter(
+                ev_q.enable_assertions(False).exists().correlate(prio_t))
+        if ranking.after is not None:
+            _, after_prio, after_id = ranking.after
+            ranked_q = ranked_q.filter(
+                tuple_(prio_t.c.priority, prio_t.c.raw_record_id)
+                > tuple_(literal(after_prio), literal(after_id)))
+        ranked_q = ranked_q.order_by(prio_t.c.priority,
+                                     prio_t.c.raw_record_id).limit(fetch_n)
+        ranked_al = ranked_q.subquery().lateral('ranked')
+        stmts_q = mk_hashes_al.outerjoin(ranked_al, true())
+        prio_c = ranked_al.c.ev_priority
+        id_c = ranked_al.c.raw_record_id
+
+        if generation['scope_kind'] == 'statements':
+            # Statements outside a scoped development generation keep the
+            # legacy evidence set, in deterministic raw-id order, after an
+            # explicit "unranked" marker priority. For a given statement at
+            # most one of the two laterals can return rows.
+            scope_t = ranking_tables.generation_statement
+            in_scope = exists().where(and_(
+                scope_t.c.generation_id == gen_id,
+                scope_t.c.mk_hash == mk_hashes_al.c.mk_hash))
+            unranked_q = (ro.session
+                          .query(literal(UNRANKED_PRIORITY, SmallInteger)
+                                 .label('ev_priority'),
+                                 frp.id.label('raw_record_id'))
+                          .select_from(frp)
+                          .filter(frp.mk_hash == mk_hashes_al.c.mk_hash,
+                                  ~in_scope))
+            # CAST: a bare bound integer would render as ORDER BY <position>.
+            unranked_al = finish(unranked_q,
+                                 cast(literal(UNRANKED_PRIORITY),
+                                      SmallInteger),
+                                 frp.id).subquery().lateral('unranked')
+            stmts_q = stmts_q.outerjoin(unranked_al, true())
+            prio_c = func.coalesce(prio_c, unranked_al.c.ev_priority)
+            id_c = func.coalesce(id_c, unranked_al.c.raw_record_id)
+
+        # Core alias: orm.aliased() on the per-request mapped class cost ~4 ms
+        # per request in profiling (mapper configuration); SQL is identical.
+        ev_frp = frp.__table__.alias('ev_frp').c
+        stmts_q = (stmts_q
+                   .outerjoin(ev_frp.id.table,
+                              and_(ev_frp.id == id_c,
+                                   ev_frp.mk_hash == mk_hashes_al.c.mk_hash))
+                   .outerjoin(ro.SourceMeta,
+                              ro.SourceMeta.mk_hash == mk_hashes_al.c.mk_hash)
+                   .outerjoin(ro.ReadingRefLink,
+                              ro.ReadingRefLink.rid == ev_frp.reading_id))
+        ref_link_keys = [k for k in ro.ReadingRefLink.__dict__.keys()
+                         if not k.startswith('_')]
+        cols = [mk_hashes_al.c.mk_hash, ro.SourceMeta.src_json,
+                mk_hashes_al.c.ev_count, mk_hashes_al.c.belief,
+                ev_frp.raw_json, ev_frp.pa_json,
+                prio_c.label('ev_priority'), id_c.label('raw_record_id'),
+                ranked_al.c.c_status, ranked_al.c.p_status]
+        cols += [getattr(ro.ReadingRefLink, k) for k in ref_link_keys]
+        selection = (select(cols).select_from(stmts_q)
+                     .order_by(outer_sort, mk_hashes_al.c.mk_hash,
+                               prio_c, id_c))
+
+        if self._print_only:
+            from sqlalchemy.dialects import postgresql
+            print(selection.compile(dialect=postgresql.dialect(),
+                                    compile_kwargs={'literal_binds': True}))
+            return
+        logger.info("Executing query (get_statements, ranked evidence)")
+        res = connection.execute(selection).fetchall()
+
+        stmts_dict = OrderedDict()
+        ev_counts = OrderedDict()
+        beliefs = OrderedDict()
+        source_counts = OrderedDict()
+        pages = OrderedDict()
+        returned_evidence = 0
+        src_set = ro.get_source_names()
+        for row in res:
+            row_gen = iter(row)
+            mk_hash = next(row_gen)
+            src_dict = dict.fromkeys(src_set, 0)
+            src_dict.update(next(row_gen))
+            ev_count = next(row_gen)
+            belief = next(row_gen)
+            raw_json_bts = next(row_gen)
+            pa_json_bts = next(row_gen)
+            ev_priority = next(row_gen)
+            raw_record_id = next(row_gen)
+            c_status = next(row_gen)
+            p_status = next(row_gen)
+            ref_dict = dict(zip(ref_link_keys, row_gen))
+            if pa_json_bts is None:
+                # Same behaviour as the legacy path: every evidence record of
+                # this statement was filtered out.
+                continue
+            if mk_hash not in stmts_dict:
+                source_counts[mk_hash] = src_dict
+                ev_counts[mk_hash] = ev_count
+                beliefs[mk_hash] = belief
+                stmts_dict[mk_hash] = json.loads(pa_json_bts.decode('utf-8'))
+                stmts_dict[mk_hash]['belief'] = belief
+                stmts_dict[mk_hash]['evidence'] = []
+                pages[mk_hash] = {'has_more': False, 'last': None,
+                                  'ranked': ev_priority != UNRANKED_PRIORITY,
+                                  'records': []}
+            page = pages[mk_hash]
+            if len(stmts_dict[mk_hash]['evidence']) >= ranking.page_size:
+                # The extra (page_size + 1)th row only proves there is more.
+                page['has_more'] = True
+                continue
+            ev_json = _evidence_json_from_row(raw_json_bts, ref_dict)
+            ev_json['evidence_ranking'] = {
+                'raw_record_id': str(raw_record_id),
+                'priority': (None if ev_priority == UNRANKED_PRIORITY
+                             else ev_priority),
+                'correctness_status': CORRECTNESS_STATUS_NAMES.get(c_status),
+                'provenance_status': PROVENANCE_STATUS_NAMES.get(p_status),
+            }
+            stmts_dict[mk_hash]['evidence'].append(ev_json)
+            page['records'].append(ev_json['evidence_ranking'])
+            page['last'] = (ev_priority, raw_record_id)
+            returned_evidence += 1
+
+        result = StatementQueryResult(stmts_dict, limit, offset, ev_counts,
+                                      beliefs, returned_evidence,
+                                      source_counts, self.to_json())
+        result.evidence_pages = pages
+        return result
+
+    @_release_owned_readonly
     def get_hashes(self, ro=None, limit=None, offset=None, sort_by='ev_count',
                    with_src_counts=True) \
             -> Optional[QueryResult]:
@@ -657,8 +915,7 @@ class Query(object):
             An object holding the results of the query, as well as the metadata
             for the query definition.
         """
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
 
         # If the result is by definition empty, save time and effort.
         if self.empty:
@@ -710,6 +967,7 @@ class Query(object):
                            belief_scores, source_counts, self.to_json(),
                            'hashes')
 
+    @_release_owned_readonly
     def get_interactions(self, ro=None, limit=None, offset=None,
                          sort_by='ev_count') -> Optional[QueryResult]:
         """Get the simple interaction information from the Statements metadata.
@@ -732,8 +990,7 @@ class Query(object):
             Options are currently 'ev_count' or 'belief'. Results will return in
             order of the given parameter.
         """
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
 
         if self.empty:
             if self._print_only:
@@ -751,6 +1008,7 @@ class Query(object):
                            belief_scores, src_counts, self.to_json(),
                            il.meta_type)
 
+    @_release_owned_readonly
     def get_relations(self, ro=None, limit=None, offset=None,
                       sort_by='ev_count', with_hashes=False) \
             -> Optional[QueryResult]:
@@ -777,8 +1035,7 @@ class Query(object):
             Default is False. If True, retrieve all the hashes that fit within
             each relational grouping.
         """
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
 
         if self.empty:
             return QueryResult.empty({}, limit, offset, self.to_json(),
@@ -795,6 +1052,7 @@ class Query(object):
                            belief_scores, src_counts, self.to_json(),
                            r_sql.meta_type)
 
+    @_release_owned_readonly
     def get_agents(self, ro=None, limit=None, offset=None, sort_by='ev_count',
                    with_hashes=False, complexes_covered=None) \
             -> Optional[QueryResult]:
@@ -824,8 +1082,7 @@ class Query(object):
             The set of hashes for complexes that you have already seen and would
             like skipped.
         """
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
 
         if self.empty:
             return AgentQueryResult.empty(limit, offset, self.to_json())
@@ -1121,9 +1378,9 @@ class AgentInteractionMeta:
 
 
 class AgentJsonExpander(AgentInteractionMeta):
+    @_release_owned_readonly
     def expand(self, ro=None, sort_by='ev_count'):
-        if ro is None:
-            ro = get_ro('primary')
+        # (Handle obtained/released by @_release_owned_readonly.)
         if self.stmt_type is None:
             meta = RelationSQL(ro, with_complex_dups=True)
         else:
@@ -3101,6 +3358,39 @@ class EvidenceFilter:
             query = ev_filter.join_table(ro, query, tables_joined)
 
         return query
+
+
+def _evidence_json_from_row(raw_json_bts, ref_dict):
+    """Build the served evidence JSON from a raw record and its text refs."""
+    raw_json = clean_json_loads(raw_json_bts.decode('utf-8'))
+    ev_json = raw_json['evidence'][0]
+    if 'annotations' not in ev_json.keys():
+        ev_json['annotations'] = {}
+
+    # Add agents' raw text to annotations.
+    ev_json['annotations']['agents'] = \
+        {'raw_text': _get_raw_texts(raw_json)}
+
+    # Add prior UUIDs to the annotations
+    if 'prior_uuids' not in ev_json['annotations'].keys():
+        ev_json['annotations']['prior_uuids'] = []
+    ev_json['annotations']['prior_uuids'].append(raw_json['id'])
+
+    # Add and/or update text refs.
+    if 'text_refs' not in ev_json.keys():
+        ev_json['text_refs'] = {}
+    if ref_dict['pmid']:
+        ev_json['pmid'] = ref_dict['pmid']
+    elif 'PMID' in ev_json['text_refs']:
+        del ev_json['text_refs']['PMID']
+    ev_json['text_refs'].update({k.upper(): v
+                                 for k, v in ref_dict.items()
+                                 if v is not None})
+
+    # Add the source dictionary.
+    if ref_dict['source']:
+        ev_json['annotations']['content_source'] = ref_dict['source']
+    return ev_json
 
 
 def _get_raw_texts(stmt_json):

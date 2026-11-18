@@ -248,15 +248,20 @@ class DatabaseManager(object):
 
         # Check to see if the database if available.
         self.available = True
+        ping_engine = create_engine(
+            self.url,
+            connect_args={'connect_timeout': 1}
+        )
         try:
-            create_engine(
-                self.url,
-                connect_args={'connect_timeout': 1}
-            ).execute('SELECT 1 AS ping;')
+            ping_engine.execute('SELECT 1 AS ping;')
         except Exception as err:
             logger.warning(f"Database {repr(self.url)} is not available: {err}")
             self.available = False
             return
+        finally:
+            # Close the ping connection now; otherwise it stays open until
+            # cyclic garbage collection reaches the discarded engine's pool.
+            ping_engine.dispose()
 
         # Create the engine (connection manager).
         # Try to use pool_pre_ping=True and increase the pool size from the default 5:
@@ -295,6 +300,22 @@ class DatabaseManager(object):
             logger.error("Cannot get a direct connection in protected mode.")
             return
         return self.__engine.connect()
+
+    def close(self):
+        """Release this handle's database connections.
+
+        Ends the session's transaction (rolling back any open or aborted
+        transaction) and closes every pooled connection of this handle's
+        engine. The handle remains usable: a later query opens new
+        connections. Safe to call more than once and on unavailable handles.
+        """
+        if not getattr(self, 'available', False):
+            return
+        try:
+            if self.session is not None:
+                self.session.close()
+        finally:
+            self.__engine.dispose()
 
     def __del__(self, *args, **kwargs):
         if not hasattr(self, 'available') or self.available:

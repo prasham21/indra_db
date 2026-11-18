@@ -117,4 +117,7 @@ def get_ro_host(ro_label):
     ro = get_ro(ro_label)
     if not ro:
         return None
-    return ro.url.host
+    try:
+        return ro.url.host
+    finally:
+        ro.close()  # Release the handle built only to read the host.
